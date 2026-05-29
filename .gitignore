@@ -1,0 +1,21 @@
+# Python Cache Files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local Environment Config (with secrets)
+.env
+
+# LocalStack Data & Volume
+localstack/
+
+# Lambda ZIP packages
+*.zip
+
+# IDEs & System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+temp_output_verify.png
