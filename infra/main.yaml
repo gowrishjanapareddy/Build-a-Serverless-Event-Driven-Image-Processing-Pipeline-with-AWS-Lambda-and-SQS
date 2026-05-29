@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless Event-Driven Image Processing Pipeline'
+
+Parameters:
+  UniqueId:
+    Type: String
+    Default: 'gowri-surya'
+    Description: 'Unique suffix for resource names (e.g., S3 buckets) to ensure global uniqueness'
+  TargetWidth:
+    Type: String
+    Default: '200'
+    Description: 'Target width for image resizing'
+  WatermarkText:
+    Type: String
+    Default: '© MyCompany'
+    Description: 'Text to burn into processed images as a watermark'
+  LambdaDeploymentBucket:
+    Type: String
+    Default: 'lambda-deployments-bucket'
+    Description: 'S3 bucket containing the lambda source zip files (pre-created during deployment)'
+
+Resources:
+  # SQS Queues
+  DLQProcessorErrors:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub 'DLQProcessorErrors-${UniqueId}'
+
+  DLQProcessedMessages:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub 'DLQProcessedMessages-${UniqueId}'
+
+  ImageProcessedQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: !Sub 'ImageProcessedQueue-${UniqueId}'
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQProcessedMessages.Arn
+        maxReceiveCount: 5
+
+  # DynamoDB Table
+  ImageMetadataTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub 'ImageMetadataTable-${UniqueId}'
+      AttributeDefinitions:
+        - AttributeName: 'originalKey'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'originalKey'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  # IAM Roles
+  ImageProcessorRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'ImageProcessorRole-${UniqueId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub 'ImageProcessorPolicy-${UniqueId}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::input-image-bucket-${UniqueId}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::processed-image-bucket-${UniqueId}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'sqs:SendMessage'
+                Resource:
+                  - !GetAtt ImageProcessedQueue.Arn
+                  - !GetAtt DLQProcessorErrors.Arn
+
+  MetadataUpdaterRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'MetadataUpdaterRole-${UniqueId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub 'MetadataUpdaterPolicy-${UniqueId}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: 'Allow'
+                Action:
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt ImageProcessedQueue.Arn
+              - Effect: 'Allow'
+                Action:
+                  - 'dynamodb:PutItem'
+                Resource: !GetAtt ImageMetadataTable.Arn
+
+  # AWS Lambda Functions
+  ImageProcessorLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub 'ImageProcessorLambda-${UniqueId}'
+      Runtime: 'python3.12'
+      Handler: 'app.handler'
+      Role: !GetAtt ImageProcessorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: 'image_processor.zip'
+      Environment:
+        Variables:
+          TARGET_WIDTH: !Ref TargetWidth
+          WATERMARK_TEXT: !Ref WatermarkText
+          SQS_QUEUE_URL: !Ref ImageProcessedQueue
+          DLQ_QUEUE_URL: !Ref DLQProcessorErrors
+          PROCESSED_BUCKET_NAME: !Sub 'processed-image-bucket-${UniqueId}'
+
+  MetadataUpdaterLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub 'MetadataUpdaterLambda-${UniqueId}'
+      Runtime: 'python3.12'
+      Handler: 'app.handler'
+      Role: !GetAtt MetadataUpdaterRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref LambdaDeploymentBucket
+        S3Key: 'metadata_updater.zip'
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref ImageMetadataTable
+
+  # Lambda Permissions (broken circular dependency by hardcoding source S3 ARN string format)
+  InputBucketPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt ImageProcessorLambda.Arn
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::input-image-bucket-${UniqueId}'
+
+  # S3 Buckets
+  InputImageBucket:
+    Type: 'AWS::S3::Bucket'
+    DependsOn: InputBucketPermission
+    Properties:
+      BucketName: !Sub 'input-image-bucket-${UniqueId}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt ImageProcessorLambda.Arn
+
+  ProcessedImageBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'processed-image-bucket-${UniqueId}'
+
+  # SQS Trigger to MetadataUpdaterLambda
+  SQSEventSourceMapping:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt ImageProcessedQueue.Arn
+      FunctionName: !GetAtt MetadataUpdaterLambda.Arn
