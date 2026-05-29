@@ -19,8 +19,3 @@ localstack/
 .DS_Store
 Thumbs.db
 temp_output_verify.png
-
-# Task PDF and parsing files
-task.pdf
-task_text.txt
-read_pdf.py
